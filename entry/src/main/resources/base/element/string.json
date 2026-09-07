@@ -1,0 +1,20 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "智能语音计算器"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "智能语音计算器入口"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "智能语音计算器"
+    },
+    {
+      "name": "microphone_reason",
+      "value": "用于识别语音算式"
+    }
+  ]
+}
