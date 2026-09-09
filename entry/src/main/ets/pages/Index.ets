@@ -186,15 +186,14 @@ struct Index {
       SpeechKitService.speakPriority(text) : SpeechKitService.speakKey(text)
     task.catch((error: Error) => {
       if (error.message === '播报已取消') return
-      this.speechEnabled = false
-      this.recognizedText = '按键播报暂不可用，点击“播报 关”重试'
+      this.recognizedText = '本次语音播报失败，可继续使用'
     })
   }
 
   private async toggleSpeech(): Promise<void> {
     if (this.speechEnabled) {
       this.speechEnabled = false
-      SpeechKitService.stopSpeaking()
+      await SpeechKitService.stopSpeaking()
       this.recognizedText = '按键播报已关闭'
       return
     }

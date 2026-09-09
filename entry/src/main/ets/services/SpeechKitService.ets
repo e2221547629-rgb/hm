@@ -17,8 +17,15 @@ export class SpeechKitService {
   private static currentTask: SpeechTask | undefined = undefined
   private static requestSequence: number = 0
   private static playbackTimeout: number = -1
+  private static nextPlayTimer: number = -1
+  private static stopping: boolean = false
+  private static stopResolver: (() => void) | undefined = undefined
+  private static stopPromise: Promise<void> | undefined = undefined
+  private static stopTimeout: number = -1
   private static asrEngine: speechRecognizer.SpeechRecognitionEngine | undefined = undefined
   private static sessionId: string = ''
+
+  private static readonly KEY_GAP_MS: number = 70
 
   private static enginePromise: Promise<textToSpeech.TextToSpeechEngine> | undefined = undefined
   private static engineGeneration: number = 0
@@ -52,12 +59,20 @@ export class SpeechKitService {
       onStart: () => undefined,
       onComplete: (requestId: string, response: textToSpeech.CompleteResponse) => {
         // 合成完成并不代表播放完成。
-        if (response.type === 1) SpeechKitService.finishTask(requestId)
+        // stop() 之后可能先收到旧任务的 onComplete，必须等 onStop 才能继续。
+        if (response.type === 1 && !SpeechKitService.stopping) {
+          SpeechKitService.finishTask(requestId)
+        }
       },
-      onStop: (requestId: string) => {
-        SpeechKitService.finishTask(requestId, new Error('播报已取消'))
+      onStop: (_requestId: string) => {
+        SpeechKitService.finishStopping()
       },
       onError: (requestId: string, errorCode: number, errorMessage: string) => {
+        // 主动停止期间的错误属于停止流程，不能再把它当成普通播报失败。
+        if (SpeechKitService.stopping) {
+          SpeechKitService.finishStopping()
+          return
+        }
         if (SpeechKitService.engine !== engine ||
           SpeechKitService.currentTask?.requestId !== requestId) return
         SpeechKitService.resetTtsEngine()
@@ -75,7 +90,12 @@ export class SpeechKitService {
     SpeechKitService.currentTask = undefined
     if (error !== undefined) task.reject(error)
     else task.resolve()
-    SpeechKitService.playNext()
+
+    // 给系统播放器一个短暂的切换间隔，避免连续短词被粘连或丢失。
+    SpeechKitService.nextPlayTimer = setTimeout(() => {
+      SpeechKitService.nextPlayTimer = -1
+      SpeechKitService.playNext()
+    }, SpeechKitService.KEY_GAP_MS)
   }
 
   private static resetTtsEngine(): void {
@@ -99,7 +119,7 @@ export class SpeechKitService {
   }
 
   static async speakPriority(text: string): Promise<void> {
-    SpeechKitService.stopSpeaking()
+    await SpeechKitService.stopSpeaking()
     await SpeechKitService.enqueue(text, 'priority')
   }
 
@@ -118,7 +138,10 @@ export class SpeechKitService {
   }
 
   private static async playNext(): Promise<void> {
-    if (SpeechKitService.currentTask !== undefined || SpeechKitService.speechQueue.length === 0) return
+    if (SpeechKitService.stopping ||
+      SpeechKitService.currentTask !== undefined ||
+      SpeechKitService.nextPlayTimer >= 0 ||
+      SpeechKitService.speechQueue.length === 0) return
     const task: SpeechTask | undefined = SpeechKitService.speechQueue.shift()
     if (task === undefined) return
     SpeechKitService.currentTask = task
@@ -159,20 +182,66 @@ export class SpeechKitService {
     }
   }
 
-  static stopSpeaking(): void {
+  private static finishStopping(): void {
+    if (!SpeechKitService.stopping) return
+
+    if (SpeechKitService.stopTimeout >= 0) {
+      clearTimeout(SpeechKitService.stopTimeout)
+      SpeechKitService.stopTimeout = -1
+    }
+
+    SpeechKitService.stopping = false
+    const resolver = SpeechKitService.stopResolver
+    SpeechKitService.stopResolver = undefined
+    SpeechKitService.stopPromise = undefined
+    resolver?.()
+  }
+
+  static async stopSpeaking(): Promise<void> {
     SpeechKitService.clearPlaybackTimeout()
+
+    if (SpeechKitService.nextPlayTimer >= 0) {
+      clearTimeout(SpeechKitService.nextPlayTimer)
+      SpeechKitService.nextPlayTimer = -1
+    }
+
     const task = SpeechKitService.currentTask
     SpeechKitService.currentTask = undefined
     const cancelled = new Error('播报已取消')
     SpeechKitService.speechQueue.forEach((queued: SpeechTask) => queued.reject(cancelled))
     SpeechKitService.speechQueue = []
     task?.reject(cancelled)
-    // 先清理任务，再停止引擎；迟到的完成/停止回调不能推进新队列。
-    try { SpeechKitService.engine?.stop() } catch (_) { }
+
+    const previousStop = SpeechKitService.stopPromise
+    if (previousStop !== undefined) {
+      await previousStop
+      return
+    }
+
+    const engine = SpeechKitService.engine
+    if (engine === undefined) return
+
+    // 先标记 stopping，再停止引擎；onComplete 不能在 onStop 前推进队列。
+    SpeechKitService.stopping = true
+    const pending = new Promise<void>((resolve: () => void) => {
+      SpeechKitService.stopResolver = resolve
+    })
+    SpeechKitService.stopPromise = pending
+    SpeechKitService.stopTimeout = setTimeout(() => {
+      SpeechKitService.finishStopping()
+    }, 800)
+
+    try {
+      engine.stop()
+    } catch (_) {
+      SpeechKitService.finishStopping()
+    }
+
+    await pending
   }
 
   static async release(): Promise<void> {
-    SpeechKitService.stopSpeaking()
+    await SpeechKitService.stopSpeaking()
     SpeechKitService.resetTtsEngine()
     await SpeechKitService.stopRecognition()
   }
@@ -183,7 +252,7 @@ export class SpeechKitService {
       return
     }
     try {
-      SpeechKitService.stopSpeaking()
+      await SpeechKitService.stopSpeaking()
       SpeechKitService.asrEngine = await speechRecognizer.createEngine({
         language: 'zh-CN',
         online: 1,
